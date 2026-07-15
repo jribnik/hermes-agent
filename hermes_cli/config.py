@@ -4774,6 +4774,10 @@ def _normalize_custom_provider_entry(
         # configs don't warn on every load.
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
+        # ``auth_type`` selects a non-API-key auth handler for a built-in
+        # provider (e.g. providers.anthropic.auth_type: oauth_claude_code).
+        # See hermes_cli.providers.OAUTH_AUTH_HANDLERS.
+        "auth_type",
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",

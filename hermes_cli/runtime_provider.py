@@ -255,6 +255,52 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     return False
 
 
+def _anthropic_claude_code_oauth_configured() -> bool:
+    """True when config.yaml opts native Anthropic into Claude Code OAuth.
+
+    Set via ``hermes config set providers.anthropic.auth_type oauth_claude_code``
+    — Hermes then authenticates with the OAuth token the Claude CLI manages at
+    ~/.claude/.credentials.json (Claude Pro/Max subscription) instead of the
+    env-var API-key chain.
+    """
+    try:
+        config = load_config()
+    except Exception:
+        return False
+    providers_cfg = config.get("providers")
+    if not isinstance(providers_cfg, dict):
+        return False
+    entry = providers_cfg.get("anthropic")
+    if not isinstance(entry, dict):
+        return False
+
+    from providers.auth.anthropic_oauth import is_claude_code_oauth_auth_type
+
+    return is_claude_code_oauth_auth_type(entry.get("auth_type"))
+
+
+def _resolve_anthropic_runtime_token() -> Optional[str]:
+    """Resolve the bearer credential for native Anthropic Messages calls.
+
+    When the config selects Claude Code OAuth, resolve through the registered
+    handler — its AuthError (missing/expired-beyond-refresh credentials, with
+    relogin hints) propagates rather than silently falling back to an API key
+    the user explicitly opted out of. Otherwise use the standard
+    ``resolve_anthropic_token`` env/credential-file priority chain.
+    """
+    if _anthropic_claude_code_oauth_configured():
+        from hermes_cli.providers import get_oauth_auth_handler
+
+        handler = get_oauth_auth_handler("oauth_claude_code")
+        if handler is not None:
+            creds = handler()
+            return str(creds.get("api_key") or "") or None
+
+    from agent.anthropic_adapter import resolve_anthropic_token
+
+    return resolve_anthropic_token()
+
+
 def _auto_detect_local_model(base_url: str) -> str:
     """Query a local server for its model name when only one model is loaded."""
     if not base_url:
@@ -1380,9 +1426,7 @@ def _resolve_explicit_runtime(
         base_url = explicit_base_url or cfg_base_url or "https://api.anthropic.com"
         api_key = explicit_api_key
         if not api_key:
-            from agent.anthropic_adapter import resolve_anthropic_token
-
-            api_key = resolve_anthropic_token()
+            api_key = _resolve_anthropic_runtime_token()
             if not api_key:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
@@ -1917,8 +1961,7 @@ def resolve_runtime_provider(
                     "config.yaml model section at a custom env var."
                 )
         else:
-            from agent.anthropic_adapter import resolve_anthropic_token
-            token = resolve_anthropic_token()
+            token = _resolve_anthropic_runtime_token()
             if not token:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
