@@ -498,6 +498,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Lazily-built WebClient backed by SLACK_USER_TOKEN (xoxp-...), used
+        # only for conversations.mark — see _get_user_client.
+        self._user_client: Optional[Any] = None
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1465,6 +1468,20 @@ class SlackAdapter(BasePlatformAdapter):
                     for old_ts in list(self._bot_message_ts)[:excess]:
                         self._bot_message_ts.discard(old_ts)
 
+            # Opt-in: after tool output lands in a thread, advance the
+            # channel's read cursor so streamed tool-progress posts don't
+            # accumulate unread badges (platforms.slack.mark_tool_threads_read).
+            # The gateway tags tool-progress sends with is_tool_output; normal
+            # replies never carry it. Best-effort — _mark_thread_read swallows
+            # API failures.
+            if (
+                thread_ts
+                and sent_ts
+                and (metadata or {}).get("is_tool_output")
+                and self._mark_tool_threads_read_enabled()
+            ):
+                await self._mark_thread_read(chat_id, sent_ts, thread_ts, metadata)
+
             return SendResult(
                 success=True,
                 message_id=sent_ts,
@@ -1686,6 +1703,78 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _mark_tool_threads_read_enabled(self) -> bool:
+        """Whether the bot marks a channel read after posting tool output in a thread.
+
+        Opt-in via ``platforms.slack.mark_tool_threads_read`` (default
+        ``false``).  Streamed tool-progress lines land as regular thread
+        messages, so on busy sessions they pile up unread badges for the
+        workspace member whose token performs the marking; enabling this
+        calls ``conversations.mark`` after each tool-output post to keep the
+        channel's read cursor current.
+        """
+        raw = self.config.extra.get("mark_tool_threads_read")
+        if raw is None:
+            return False  # default: never touch read state
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _get_user_client(self) -> Optional[Any]:
+        """Return a WebClient backed by ``SLACK_USER_TOKEN``, if configured.
+
+        ``conversations.mark`` only moves the read cursor of the token's own
+        principal — a bot token marks the *bot's* cursor, leaving the human
+        user's unread badge untouched.  Clearing the user's badge requires a
+        user token (xoxp-...) with the ``channels:write``/``im:write``-family
+        scopes.  Built lazily on first use and cached.
+        """
+        if self._user_client is not None:
+            return self._user_client
+        token = (os.getenv("SLACK_USER_TOKEN") or "").strip()
+        if not token:
+            return None
+        client = AsyncWebClient(token=token)
+        _apply_slack_proxy(client, self._proxy_url)
+        self._user_client = client
+        return client
+
+    async def _mark_thread_read(
+        self,
+        chat_id: str,
+        ts: str,
+        thread_ts: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mark the thread rooted at *thread_ts* read up to *ts*.
+
+        Called after tool output lands in a thread when
+        ``mark_tool_threads_read`` is enabled.  ``conversations.mark`` on the
+        parent channel (*chat_id*) does not clear thread unread badges, so
+        the thread root timestamp is passed as the conversation instead.
+        Uses the ``SLACK_USER_TOKEN`` client when available (a bot token can
+        call ``conversations.mark`` but only moves the bot's own read cursor,
+        not the user's); falls back to the bot client best-effort.  Any API
+        failure (missing scope, unsupported conversation type, rate limit)
+        is swallowed with a warning log — read-state grooming must never
+        break message delivery.
+        """
+        try:
+            client = self._get_user_client() or self._get_client(
+                chat_id, team_id=self._metadata_team_id(metadata)
+            )
+            await client.conversations_mark(channel=str(thread_ts), ts=str(ts))
+            logger.info(
+                "[Slack] Marked thread %s in %s as read (user cursor)",
+                thread_ts,
+                chat_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Slack] conversations.mark failed for thread %s in %s: %s",
+                thread_ts,
+                chat_id,
+                e,
+            )
 
     def _cron_continuable_surface(self) -> str:
         """Resolve the continuable-cron delivery surface for this platform.
@@ -2209,6 +2298,29 @@ class SlackAdapter(BasePlatformAdapter):
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
+
+    def _auto_react_enabled(self) -> bool:
+        """Whether the bot immediately reacts to incoming user messages.
+
+        Opt-in via ``platforms.slack.extra.auto_react_enabled`` (default
+        ``false``).  When enabled, the reaction is added as soon as a message
+        passes routing — before thread-context fetches, file downloads, and
+        agent queueing — so the sender gets an instant "seen" acknowledgement.
+        """
+        raw = self.config.extra.get("auto_react_enabled")
+        if raw is None:
+            return False  # default: no auto-react
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _auto_react_emoji(self) -> str:
+        """Emoji name used by the auto-react acknowledgement.
+
+        Set ``platforms.slack.extra.auto_react_emoji`` to any Slack emoji
+        name (colons optional).  Defaults to ``eyes`` (👀).
+        """
+        raw = self.config.extra.get("auto_react_emoji")
+        emoji = str(raw).strip().strip(":") if raw else ""
+        return emoji or "eyes"
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -3371,6 +3483,18 @@ class SlackAdapter(BasePlatformAdapter):
                     and not has_session
                 ):
                     return
+
+        # Auto-react acknowledgement: fires as the first action once routing
+        # commits to processing this message — before thread-context fetches,
+        # file downloads, and agent queueing — so the sender sees the message
+        # was received even when the agent's reply takes a while.  Opt-in via
+        # auto_react_enabled; _add_reaction swallows API failures (already
+        # reacted, missing reactions:write scope) so this never blocks
+        # delivery.
+        if self._auto_react_enabled() and channel_id and ts:
+            await self._add_reaction(
+                channel_id, ts, self._auto_react_emoji(), str(team_id or "")
+            )
 
         if is_mentioned:
             # Strip the bot mention from the text
