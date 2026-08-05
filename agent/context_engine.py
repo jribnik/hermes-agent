@@ -201,6 +201,26 @@ class ContextEngine(ABC):
         self.last_total_tokens = 0
         self.compression_count = 0
 
+    def shutdown(self) -> None:
+        """Release process resources held by this engine at agent teardown.
+
+        Terminal, one-way cleanup. Unlike ``on_session_end`` — a session
+        boundary that may be followed by ``on_session_start`` on the same
+        engine instance, so it keeps durable handles open — ``shutdown`` is
+        called from ``AIAgent.close()`` when the agent itself is disposed and
+        will not be reused. Engines that hold OS resources (open SQLite
+        connections, file handles, worker pools) should close them here.
+
+        Default is a no-op: the built-in compressor holds no such resources.
+        Without this hook a resource-holding plugin engine can only release
+        handles via ``__del__``, which does not run promptly under a
+        long-lived gateway that caches and evicts many agents — leaking a few
+        file descriptors per agent until the process hits EMFILE.
+        """
+
+    # -- Optional: tools ---------------------------------------------------
+
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Tool schemas this engine exposes to the agent (default: none)."""
         return []

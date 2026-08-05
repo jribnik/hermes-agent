@@ -1052,6 +1052,26 @@ class AIAgent(
             from hermes_state_registry import release_or_close
             release_or_close(session_db)
 
+        # 10. Shut down the context engine, releasing any OS resources it holds
+        # (e.g. a plugin engine's SQLite connections on lcm.db — distinct from
+        # the session_db state.db handle closed in step 9). close() already tears
+        # down every other resource class — processes, sandboxes, browser
+        # daemons, the httpx client, memory providers — but not the context
+        # engine, so a resource-holding engine leaked handles on every agent
+        # teardown (reclaimed only by GC-__del__, which does not run promptly
+        # under a long-lived gateway). Gate on the same _end_session_on_close
+        # signal used for the session row above so a temporary compression
+        # helper / background-review fork that shares a parent's engine never
+        # tears shared resources out from under the live parent. shutdown() is
+        # a no-op for engines that hold nothing.
+        try:
+            if getattr(self, "_end_session_on_close", True):
+                engine = getattr(self, "context_compressor", None)
+                if engine is not None and hasattr(engine, "shutdown"):
+                    engine.shutdown()
+        except Exception:
+            pass
+
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """Replay the most recent todo tool response (the gateway builds a fresh AIAgent per message). Only
         results paired with an earlier assistant ``todo`` call count — a forged bare ``role: tool`` message
