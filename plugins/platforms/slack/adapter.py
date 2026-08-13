@@ -4505,6 +4505,18 @@ class SlackAdapter(BasePlatformAdapter):
         is_mentioned = bool(
             (bot_uid and f"<@{bot_uid}>" in routing_text)
             or self._slack_message_matches_mention_patterns(routing_text))
+        # Whether this channel replies without a mention (free-response / mention-not-required,
+        # e.g. a dedicated bot channel like hermes-home with require_mention off). Computed here,
+        # next to is_mentioned, rather than inline at each use site — this is a LOCAL FORK PATCH
+        # (candidate to upstream) and upstream repeatedly churns the nearby _build_message_event()
+        # call signature; keeping this off that call's lines avoids re-conflicting on every carry.
+        _channel_free_response = (
+            channel_id not in self._slack_require_mention_channels()
+            and (
+                channel_id in self._slack_free_response_channels()
+                or not self._slack_require_mention()
+            )
+        )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal triggers (reactions) skip the mention requirement but NOT
@@ -4545,9 +4557,9 @@ class SlackAdapter(BasePlatformAdapter):
             is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
             user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
             media_types=media_types, media_text_inlined=media_text_inlined, channel_context=channel_context)
-        # React only when directly addressed; MPIMs are shared, so they need a
-        # mention like any channel.
-        if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
+        # React whenever the bot will actually reply, not just on explicit mentions
+        # (see _channel_free_response above — LOCAL FORK PATCH, candidate to upstream).
+        if (is_one_to_one_dm or is_mentioned or _channel_free_response) and self._reactions_enabled():
             self._track_reacting_message(team_id, ts)
         # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
         # the agent per view switch and leak stale context). Inert label, never a channel body.
