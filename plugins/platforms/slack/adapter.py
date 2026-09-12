@@ -3136,6 +3136,12 @@ class SlackAdapter(BasePlatformAdapter):
         configured = _extra_or_secret(self.config.extra, "reactions", "SLACK_REACTIONS", "true")
         return str(configured).lower() not in {"false", "0", "no"}
 
+    def _ack_emoji(self) -> str:
+        """In-progress lifecycle reaction (Slack shortname, no colons). Configurable
+        via ``platforms.slack.extra.ack_emoji``; defaults to ``eyes``."""
+        raw = (self.config.extra.get("ack_emoji") or "") if self.config.extra else ""
+        return str(raw).strip().strip(":") or "eyes"
+
     def _reacting_target(self, event: MessageEvent) -> Optional[Tuple[str, str, Any]]:
         """``(ts, team_id, marker)`` when reactions are on and ``event`` is being tracked."""
         if not self._reactions_enabled():
@@ -3153,7 +3159,7 @@ class SlackAdapter(BasePlatformAdapter):
         ts, team_id, _marker = target
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._react(channel_id, ts, "eyes", team_id, remove=False)
+            await self._react(channel_id, ts, self._ack_emoji(), team_id, remove=False)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
@@ -3165,7 +3171,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._react(channel_id, ts, "eyes", team_id, remove=True)
+        await self._react(channel_id, ts, self._ack_emoji(), team_id, remove=True)
         final = {ProcessingOutcome.SUCCESS: "white_check_mark", ProcessingOutcome.FAILURE: "x"}
         if outcome in final:
             await self._react(channel_id, ts, final[outcome], team_id, remove=False)
@@ -3714,7 +3720,7 @@ class SlackAdapter(BasePlatformAdapter):
     _REACTION_EMOJI_MAP: ClassVar[Dict[str, str]] = {
         "thumbsup": "👍", "+1": "👍", "thumbsdown": "👎", "-1": "👎", "white_check_mark": "✅",
         "heavy_check_mark": "✅", "x": "❌", "no_entry": "⛔", "warning": "⚠️", "rotating_light": "🚨",
-        "eyes": "👀", "rocket": "🚀", "tada": "🎉", "fire": "🔥", "wave": "👋"}
+        "eyes": "👀", "dark_sunglasses": "🕶️", "rocket": "🚀", "tada": "🎉", "fire": "🔥", "wave": "👋"}
 
     async def _handle_slack_reaction(self, event: dict, removed: bool = False) -> None:
         """Forward reactions as a synthetic ``reaction:<added|removed>:<emoji>`` message
