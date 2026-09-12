@@ -104,6 +104,7 @@ apps/desktop/src/**/*.d.ts
 
 # Build/debug artifacts that must never be committed
 /log.txt
+*.log
 /sqlite_leak_fix.png
 /*.png.bak
 *.tar.gz
