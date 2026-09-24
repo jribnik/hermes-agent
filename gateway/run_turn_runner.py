@@ -1045,6 +1045,22 @@ class TurnRunner:
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
         return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
 
+    def _cached_agent_is_on_current_session(self, agent) -> bool:
+        """True when the cached agent's OWN ``session_id`` is the one routing points at right now.
+
+        The cache tuple's snapshot id is recorded at agent-BUILD time and never rewritten, so an
+        in-turn compression rotation (parent row ended, live agent rebound to the child, routing
+        split-synced to the child) leaves a snapshot that is both mismatched AND ended — the exact
+        shape of the #54878 x #54947 stale-self-heal artifact, except that this agent IS the current
+        conversation and holds turns state.db may not have yet. Ask the agent, not the snapshot
+        (#66887).
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        ctx = self._ctx
+        if agent is None or agent is _AGENT_PENDING_SENTINEL or not ctx.session_id:
+            return False
+        return getattr(agent, "session_id", None) == ctx.session_id
+
     def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count):
         ctx = self._ctx
         out = self._CachedAgentLookup()
@@ -1063,7 +1079,26 @@ class TurnRunner:
             sid_mismatch = cached_sid is not None and ctx.session_id is not None and cached_sid != ctx.session_id
             # Re-validate the outside-lock dead-session peek against the tuple read under THIS lock:
             # a stale "dead" verdict must never be applied to a different (possibly live) agent.
-            if sid_mismatch and dead and cached_sid == peek_sid:
+            stale_dead = sid_mismatch and dead and cached_sid == peek_sid
+            if stale_dead and self._cached_agent_is_on_current_session(cached[0]):
+                # Only the SNAPSHOT is stale: the live agent already rotated onto the session routing
+                # points at (compression split), so there is no dead agent to discard and no post-run
+                # split sync to write the routing key back onto the ended parent — the #54878 x #54947
+                # loop cannot start from here. Discarding instead would throw away the only copy of
+                # any turn not yet flushed to state.db (#66887). Re-baseline the whole snapshot: the
+                # recorded count tracked the ENDED parent row, so it must move to this session's live
+                # count with the id, or the cross-process guard evicts the same live agent next turn.
+                logger.info(
+                    "Agent cache snapshot re-baselined for session %s: snapshot session_id %s is "
+                    "ended in state.db but the live agent already advanced to %s "
+                    "(compression-rotation artifact, #54878 x #54947) — reusing the live agent "
+                    "instead of discarding its unflushed turns", ctx.session_key, cached_sid,
+                    ctx.session_id,
+                )
+                cached = (cached[0], sig, msg_count, ctx.session_id)
+                cache[ctx.session_key] = cached
+                cached_mc, sid_mismatch, stale_dead = msg_count, False, False
+            if stale_dead:
                 logger.info(
                     "Agent cache invalidated for session %s: "
                     "cached agent's session_id %s is ended in "
