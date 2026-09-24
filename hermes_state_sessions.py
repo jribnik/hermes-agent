@@ -1434,6 +1434,54 @@ class SessionSessionsMixin:
                 current = row[0]
         return list(reversed(chain)) or [session_id]
 
+    def get_previous_session_id(
+        self, session_id: str, *, exclude_sources: Optional[Sequence[str]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """The session immediately preceding *session_id*, resolved deterministically.
+
+        Two rules tried in order — no search, no ranking, no heuristics:
+
+        1. ``lineage`` — ``sessions.parent_session_id``, written on every compression fork,
+           branch and reset continuation. This is the element before *session_id* in
+           :meth:`_session_lineage_root_to_tip`, i.e. the predecessor when the split happened
+           INSIDE one conversation (a mid-turn compression rotation, ``/new``, an idle reset).
+        2. ``session_key`` — otherwise the most recent OTHER session that shares this one's
+           routing key (``agent:<profile>:<platform>:<kind>:<team>:<channel>``) and started
+           before it. That is the predecessor across a gateway restart or a brand-new session
+           on the same channel, where no parent edge was ever written.
+
+        Recency for rule 2 is the same freshest-of expression the browse/list paths use, so a
+        predecessor whose ``last_activity_at`` lags a newer message still orders correctly.
+
+        Returns ``{"session_id": <id>, "resolved_by": "lineage" | "session_key"}``, or None when
+        the session is unknown or has no predecessor.
+        """
+        if not session_id:
+            return None
+        row = self._read_one(
+            "SELECT parent_session_id, session_key, started_at FROM sessions WHERE id = ?", (session_id,))
+        if row is None:
+            return None
+        if row["parent_session_id"]:
+            return {"session_id": str(row["parent_session_id"]), "resolved_by": "lineage"}
+        session_key, started_at = row["session_key"], row["started_at"]
+        if not session_key:
+            return None
+        # Sources hidden from recall (integrations, subagents, kanban workers) are never "the
+        # previous conversation" even when they reuse the routing key.
+        sources = [s for s in (exclude_sources or []) if s]
+        source_clause = (f" AND s.source NOT IN ({_session_ids_placeholders(len(sources))})") if sources else ""
+        last_active = _sql_session_last_active("s")
+        prev = self._read_one(
+            f"""SELECT s.id FROM sessions s
+                 WHERE s.session_key = ?
+                   AND s.id != ?
+                   AND s.started_at < ?{source_clause}
+                 ORDER BY {last_active} DESC, s.started_at DESC, s.id DESC
+                 LIMIT 1""",
+            [session_key, session_id, started_at] + sources)
+        return {"session_id": str(prev["id"]), "resolved_by": "session_key"} if prev else None
+
     def search_sessions(
         self, source: Union[str, Sequence[str], None] = None, limit: int = 20, offset: int = 0,
         workspace_key: str = None,

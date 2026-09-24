@@ -1208,3 +1208,183 @@ class TestDiscoverySessionExclusion:
         excluded = json.loads(session_search(
             query="unique lineage token alpha", limit=5, exclude_session_ids=["s_child"], db=db))
         assert not {r["session_id"] for r in excluded["results"]} & {"s_root", "s_child"}
+
+
+# =========================================================================
+# Previous shape — one deterministic step back in the lineage / routing key
+# =========================================================================
+
+_CHANNEL_KEY = "agent:main:slack:group:T0EAWEMM3:C0BDACDEPN0"
+
+
+def _seed_channel_pair(db, *, key=_CHANNEL_KEY, gap_seconds=7200):
+    """An earlier ended session and a fresh one on the SAME routing key, no parent edge —
+    the gateway-restart / idle-reset shape that has no compression lineage to walk."""
+    now = int(time.time())
+    db.create_session("s_prior", source="slack", session_key=key)
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ?, title = ? WHERE id = ?",
+        (now - gap_seconds, now - gap_seconds + 60, "idle_expiry", "Earlier channel session", "s_prior"))
+    db.append_message("s_prior", role="user", content="where did we leave the deploy?")
+    db.append_message("s_prior", role="assistant", content="waiting on the merge to land")
+    db.create_session("s_current", source="slack", session_key=key)
+    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 60, "s_current"))
+    db._conn.commit()
+    return now
+
+
+class TestPreviousShape:
+    def test_lineage_parent_wins(self, db):
+        """A compression/reset continuation steps back through parent_session_id."""
+        db.create_session("s_parent", source="slack", session_key=_CHANNEL_KEY)
+        db.append_message("s_parent", role="user", content="the long conversation")
+        db.append_message("s_parent", role="assistant", content="summarised away by compression")
+        db.end_session("s_parent", "compression")
+        db.create_session("s_child", source="slack", session_key=_CHANNEL_KEY,
+                          parent_session_id="s_parent")
+        db._conn.commit()
+
+        result = json.loads(session_search(previous=True, current_session_id="s_child", db=db))
+        assert result["success"] is True
+        assert result["found"] is True
+        assert result["session_id"] == "s_parent"
+        assert result["previous"]["resolved_by"] == "lineage"
+        assert result["previous"]["anchor_session_id"] == "s_child"
+        assert result["previous"]["end_reason"] == "compression"
+
+    def test_routing_key_fallback_when_no_parent(self, db):
+        """No parent edge (gateway restart / new session): the most recent earlier session
+        sharing the routing key is the predecessor."""
+        _seed_channel_pair(db)
+        result = json.loads(session_search(previous=True, current_session_id="s_current", db=db))
+        assert result["found"] is True
+        assert result["session_id"] == "s_prior"
+        assert result["previous"]["resolved_by"] == "session_key"
+        assert result["previous"]["session_key"] == _CHANNEL_KEY
+
+    def test_returns_the_read_shape_so_callers_need_no_special_case(self, db):
+        """The body is byte-for-byte the normal read payload for that id; `previous` is additive."""
+        _seed_channel_pair(db)
+        stepped = json.loads(session_search(previous=True, current_session_id="s_current", db=db))
+        direct = json.loads(session_search(session_id="s_prior", db=db))
+        assert stepped["mode"] == direct["mode"] == "read"
+        assert {k: stepped[k] for k in direct} == direct
+        assert [m["content"] for m in stepped["messages"]] == [
+            "where did we leave the deploy?", "waiting on the merge to land"]
+
+    def test_carries_enough_to_compute_how_long_ago(self, db):
+        """quick-resume has to be honest about staleness, so the block exposes raw timestamps
+        plus a coarse human age measured from the predecessor's last activity."""
+        now = _seed_channel_pair(db, gap_seconds=3 * 86400)
+        block = json.loads(session_search(previous=True, current_session_id="s_current", db=db))["previous"]
+        assert block["started_at"] == pytest.approx(now - 3 * 86400, abs=5)
+        assert block["ended_at"] == pytest.approx(now - 3 * 86400 + 60, abs=5)
+        assert block["last_active"] is not None
+        assert block["age_seconds"] >= 2 * 86400
+        assert block["ago"].endswith("days ago")
+
+    def test_picks_the_most_recent_predecessor_not_the_oldest(self, db):
+        now = _seed_channel_pair(db)
+        db.create_session("s_ancient", source="slack", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                         (now - 90000, now - 89000, "s_ancient"))
+        db._conn.commit()
+        result = json.loads(session_search(previous=True, current_session_id="s_current", db=db))
+        assert result["session_id"] == "s_prior"
+
+    def test_ignores_other_channels_and_hidden_sources(self, db):
+        """A different routing key is a different conversation; hidden sources (tool/subagent/
+        kanban integrations) are never 'the previous conversation' even on the same key."""
+        now = _seed_channel_pair(db)
+        db.create_session("s_other_channel", source="slack", session_key="agent:main:slack:group:T0:CZZZ")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 120, "s_other_channel"))
+        db.create_session("s_tool_run", source="tool", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 120, "s_tool_run"))
+        db._conn.commit()
+        result = json.loads(session_search(previous=True, current_session_id="s_current", db=db))
+        assert result["session_id"] == "s_prior"
+
+    def test_no_predecessor_reports_found_false_in_the_read_shape(self, db):
+        db.create_session("s_only", source="cli")
+        db._conn.commit()
+        result = json.loads(session_search(previous=True, current_session_id="s_only", db=db))
+        assert result["success"] is True
+        assert result["found"] is False
+        assert result["session_id"] is None
+        assert result["messages"] == []
+        assert "No previous session" in result["message"]
+
+    def test_explicit_session_id_names_the_anchor_to_step_back_from(self, db):
+        """session_id is the anchor under previous=True, not the session to read."""
+        _seed_channel_pair(db)
+        result = json.loads(session_search(previous=True, session_id="s_current", db=db))
+        assert result["session_id"] == "s_prior"
+
+    def test_previous_beats_the_other_shapes(self, db):
+        """Deterministic step-back wins over query/scroll args, so a caller that passes both
+        never silently falls back to a search."""
+        _seed_channel_pair(db)
+        db.append_message("s_prior", role="user", content="modpack")
+        result = json.loads(session_search(
+            previous=True, query="modpack", around_message_id=1,
+            current_session_id="s_current", db=db))
+        assert result["mode"] == "read"
+        assert result["session_id"] == "s_prior"
+
+    def test_unknown_anchor_and_missing_anchor_are_errors(self, db):
+        assert json.loads(session_search(previous=True, db=db))["success"] is False
+        assert json.loads(
+            session_search(previous=True, session_id="nope", db=db))["success"] is False
+
+    def test_reaches_the_tool_through_the_inline_executor(self, db):
+        """INLINE_TOOL_EXECUTORS maps schema args to kwargs explicitly — a new parameter that
+        isn't listed there is silently dropped in production (see the relative-bounds test)."""
+        from types import SimpleNamespace
+
+        from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
+
+        _seed_channel_pair(db)
+        agent = SimpleNamespace(_get_session_db_for_recall=lambda: db, session_id="s_current")
+        ctx = InlineToolContext(effective_task_id="task-1", tool_call_id="call-1")
+        out = json.loads(INLINE_TOOL_EXECUTORS["session_search"](agent, {"previous": True}, ctx))
+        assert out["success"] is True
+        assert out["session_id"] == "s_prior"
+        assert out["previous"]["resolved_by"] == "session_key"
+
+    def test_schema_advertises_previous(self):
+        from tools.session_search_tool import SESSION_SEARCH_SCHEMA
+
+        prop = SESSION_SEARCH_SCHEMA["parameters"]["properties"]["previous"]
+        assert prop["type"] == "boolean" and prop["default"] is False
+
+
+class TestGetPreviousSessionId:
+    """The DB primitive: deterministic, two rules, nothing else."""
+
+    def test_lineage_before_routing_key(self, db):
+        now = int(time.time())
+        db.create_session("s_a", source="slack", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 500, "s_a"))
+        db.create_session("s_b", source="slack", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 400, "s_b"))
+        db.create_session("s_c", source="slack", session_key=_CHANNEL_KEY, parent_session_id="s_a")
+        db._conn.commit()
+        # s_b is the more recent routing-key match, but s_c has a parent edge — lineage wins.
+        assert db.get_previous_session_id("s_c") == {"session_id": "s_a", "resolved_by": "lineage"}
+
+    def test_none_without_key_or_predecessor(self, db):
+        db.create_session("s_keyless", source="cli")
+        db._conn.commit()
+        assert db.get_previous_session_id("s_keyless") is None
+        assert db.get_previous_session_id("does-not-exist") is None
+        assert db.get_previous_session_id("") is None
+
+    def test_never_returns_a_later_session(self, db):
+        now = int(time.time())
+        db.create_session("s_first", source="slack", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 100, "s_first"))
+        db.create_session("s_second", source="slack", session_key=_CHANNEL_KEY)
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now, "s_second"))
+        db._conn.commit()
+        assert db.get_previous_session_id("s_first") is None
+        assert db.get_previous_session_id("s_second")["session_id"] == "s_first"

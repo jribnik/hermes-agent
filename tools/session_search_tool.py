@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Session Search Tool - long-term conversation recall over the SQLite session DB.
 
-Single-shape tool; the mode is inferred from the args: DISCOVERY (``query``;
+Single-shape tool; the mode is inferred from the args: PREVIOUS (``previous=True``;
+one deterministic lineage/routing-key step back, no search), DISCOVERY (``query``;
 FTS5 deduped by lineage, adaptive detail hydrates only the top result),
 SCROLL (``session_id`` + ``around_message_id``; ±window around the anchor),
 READ (``session_id`` alone; whole session or head/tail), BROWSE (no args).
@@ -462,6 +463,72 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
                                "Pass around_message_id (any id above) to scroll the middle.")} if truncated else {}))
 
 
+def _humanize_age(seconds: Optional[int]) -> str:
+    """Coarse "how long ago" for the staleness note the caller has to be honest about."""
+    if seconds is None or seconds < 0:
+        return "unknown"
+    for unit_seconds, label in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= unit_seconds:
+            count = seconds // unit_seconds
+            return f"{count} {label}{'s' if count != 1 else ''} ago"
+    return "just now"
+
+
+def _previous_block(anchor_session_id: str, resolved_by: Optional[str], meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Provenance + raw timestamps for a previous-session lookup.
+
+    ``age_seconds``/``ago`` are measured from the predecessor's last activity (falling back to
+    its end, then its start) so the caller can say how stale the recovered context is instead of
+    presenting it as current."""
+    started_ts = _coerce_started_ts(meta.get("started_at"))
+    ended_ts = _coerce_started_ts(meta.get("ended_at"))
+    last_ts = _coerce_started_ts(meta.get("last_activity_at")) or ended_ts or started_ts
+    age = int(time.time()) - last_ts if last_ts is not None else None
+    return {"anchor_session_id": anchor_session_id, "resolved_by": resolved_by,
+            "session_key": meta.get("session_key"), "end_reason": meta.get("end_reason"),
+            "started_at": started_ts, "ended_at": ended_ts, "last_active": last_ts,
+            "age_seconds": age, "ago": _humanize_age(age)}
+
+
+def _previous_session(db, anchor_session_id: Optional[str], link_profile: str = None) -> str:
+    """Previous shape: the session immediately preceding *anchor_session_id*, no search.
+
+    Resolution is ``SessionDB.get_previous_session_id`` — ``parent_session_id`` when the anchor
+    is a compression/branch/reset continuation, else the most recent prior session on the same
+    ``session_key`` (routing key). The body is the ordinary READ payload for whatever that
+    resolves to, so a caller handles it exactly like ``session_search(session_id=...)``; the
+    added ``previous`` block carries the provenance and the age needed to flag staleness.
+    """
+    if not anchor_session_id:
+        return tool_error(
+            "previous=true needs a session to step back from: pass session_id (required when "
+            "reading another profile, which has no current session).", success=False)
+    if not _get_session_meta(db, anchor_session_id):
+        return tool_error(f"session_id not found: {anchor_session_id}", success=False)
+    lookup = getattr(db, "get_previous_session_id", None)
+    if lookup is None:
+        return tool_error("session database does not support previous-session lookup", success=False)
+    found, err = _loud(lambda: lookup(anchor_session_id, exclude_sources=list(_HIDDEN_SESSION_SOURCES)),
+                       "get_previous_session_id failed for %s: %s", "failed to resolve the previous session",
+                       anchor_session_id)
+    if err:
+        return err
+    if not found:
+        return _ok(mode="read", found=False, session_id=None, session_meta={}, message_count=0,
+                   truncated=False, messages=[],
+                   previous=_previous_block(anchor_session_id, None, {}),
+                   message=("No previous session: this session has no parent and no earlier "
+                            "session shares its routing key. Use query= to search history instead."))
+    prev_id = found["session_id"]
+    payload = json.loads(_read_session(db, prev_id, link_profile=link_profile))
+    if payload.get("success") is False:
+        return json.dumps(payload, ensure_ascii=False)
+    payload["found"] = True
+    payload["previous"] = _previous_block(anchor_session_id, found.get("resolved_by"),
+                                          _get_session_meta(db, prev_id))
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _read_scoped(db, sid: str, profile: Optional[str]) -> str:
     """Read shape scoped to ONE store: the caller's profile, or the profile it named.
 
@@ -576,9 +643,10 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
 
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail, owned_dbs,
-              after=None, before=None, exclude_session_ids=None) -> str:
-    """Mode dispatch (see module docstring); scroll wins when an anchor is set.
-    Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
+              after=None, before=None, exclude_session_ids=None, previous=False) -> str:
+    """Mode dispatch (see module docstring); previous wins over every search shape, then scroll
+    when an anchor is set. Profile DBs opened here are appended to *owned_dbs* for the caller to
+    close."""
     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
     # split on it and adopt the embedded profile only when none was passed.
     if isinstance(session_id, str) and "/" in session_id:
@@ -596,6 +664,11 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
     if profile_db is not None:
         db, current_session_id = profile_db, None
         owned_dbs.append(profile_db)
+    # Previous shape is a deterministic lineage/routing-key step, so it takes precedence over
+    # every search shape: session_id (when given) only names the anchor to step back FROM.
+    if previous:
+        anchor = session_id.strip() if isinstance(session_id, str) and session_id.strip() else current_session_id
+        return _previous_session(db, anchor, link_profile=profile)
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
             return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
@@ -619,7 +692,8 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
 def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
                    current_session_id: str = None, session_id: str = None, around_message_id: int = None,
                    window: int = 5, sort: str = None, profile: str = None, detail: str = "adaptive",
-                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None) -> str:
+                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None,
+                   previous: bool = False) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
@@ -633,7 +707,8 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail, owned_dbs,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+                         after=after, before=before, exclude_session_ids=exclude_session_ids,
+                         previous=bool(previous))
     finally:
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
@@ -652,7 +727,9 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Recall past conversations: search or read old Hermes sessions (FTS5), or "
-        "scroll inside one. Four shapes, picked by args: `query` = discovery "
+        "scroll inside one. Five shapes, picked by args: `previous` = step back "
+        "one session in this conversation's lineage (deterministic, no search); "
+        "`query` = discovery "
         "(top-N matching sessions, top result fully hydrated); `session_id` + "
         "`around_message_id` = scroll (window of messages around an anchor); "
         "`session_id` alone = read a whole session — how you resolve an "
@@ -668,6 +745,22 @@ SESSION_SEARCH_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "previous": {
+                "type": "boolean",
+                "description": (
+                    "Previous shape. True = return the session immediately BEFORE this one, "
+                    "resolved deterministically (no search): its compression/reset parent when "
+                    "there is one, otherwise the most recent earlier session on the same "
+                    "channel. Use this to recover continuity after a session split — a "
+                    "compression rotation, a gateway restart, /new, or an idle reset — instead "
+                    "of guessing with a query. Returns the same payload as reading that session "
+                    "by id, plus a `previous` block with `resolved_by`, `last_active` and `ago`: "
+                    "say how old the recovered context is rather than presenting it as current. "
+                    "Defaults to the current session; pass session_id to step back from a "
+                    "different one."
+                ),
+                "default": False,
+            },
             "query": {
                 "type": "string",
                 "description": (
@@ -789,7 +882,8 @@ registry.register(
     schema=SESSION_SEARCH_SCHEMA,
     handler=lambda args, **kw: session_search(
         query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
-        detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
+        detail=args.get("detail", "adaptive"), previous=bool(args.get("previous")),
+        db=kw.get("db"), current_session_id=kw.get("current_session_id"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
                                     "after", "before", "exclude_session_ids")}),
     check_fn=check_session_search_requirements,
