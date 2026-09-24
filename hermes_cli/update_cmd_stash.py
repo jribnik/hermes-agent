@@ -7,6 +7,7 @@ Origin helpers are imported lazily per function (no cycle; test patches on the o
 import logging
 import re
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,27 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 #: Autostash subject contract: this prefix + UTC YYYYMMDD-HHMMSS stamp
 #: (producer _stash_local_changes_if_needed, consumer _warn_orphaned_update_autostashes).
 _AUTOSTASH_NAME_PREFIX = "hermes-update-autostash-"
+
+#: Marker file/dir (relative to .git) -> human label, for each operation that leaves the index
+#: unmerged while it's genuinely in progress. Presence of one of these is what distinguishes an
+#: active conflict resolution from stale debris an update died on years ago -- the unmerged index
+#: entries alone look identical either way.
+_IN_PROGRESS_OPERATION_MARKERS = {
+    "MERGE_HEAD": "merge",
+    "CHERRY_PICK_HEAD": "cherry-pick",
+    "REVERT_HEAD": "revert",
+    "rebase-merge": "rebase",
+    "rebase-apply": "rebase",
+}
+
+
+def _in_progress_git_operation(cwd: Path) -> Optional[str]:
+    """Label of the operation whose marker is present under .git, or None."""
+    git_dir = cwd / ".git"
+    for name, label in _IN_PROGRESS_OPERATION_MARKERS.items():
+        if (git_dir / name).exists():
+            return label
+    return None
 
 #: Age past which a leftover autostash is called out. Younger entries are normal
 #: (recent --keep-stash park); older ones are almost always forgotten.
@@ -79,8 +101,18 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     if not status.stdout.strip():
         return None
     # Unmerged index entries (interrupted merge/rebase) make `git stash` fail with
-    # "needs merge"; `git reset` drops only the index conflict state, not the tree.
+    # "needs merge"; `git reset` drops only the index conflict state, not the tree. But
+    # unmerged entries alone don't distinguish stale debris from a merge/rebase/cherry-pick
+    # someone is actively resolving right now -- only the operation's marker file does. An
+    # unattended `hermes update` that treated both the same has silently stashed (and later
+    # discarded via the diverged-checkout reset) a live conflict resolution out from under a
+    # session that was still working on it. Refuse instead when a marker says it's live.
     if _git_run(git_cmd, ["ls-files", "--unmerged"], cwd).stdout.strip():
+        in_progress = _in_progress_git_operation(cwd)
+        if in_progress is not None:
+            print(f"✗ A {in_progress} is in progress in this checkout — update aborted, nothing was changed.")
+            print(f"  Resolve or abort it first (`cd {cwd} && git status`), then re-run `hermes update`.")
+            sys.exit(1)
         print("→ Clearing unmerged index entries from a previous conflict...")
         subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
 

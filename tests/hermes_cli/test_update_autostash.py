@@ -724,6 +724,78 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         os.chmod(pkg, 0o755)
 
 
+def test_stash_refuses_when_merge_is_in_progress(tmp_path):
+    """An unattended `hermes update` must never stash/discard a merge someone is actively
+    resolving. Reported live (2026-09-24): the updater fired mid-merge, cleared the unmerged
+    index as if it were stale debris, stashed the conflicted files, and the following
+    diverged-checkout reset wiped MERGE_HEAD -- silently destroying in-progress conflict
+    resolution. `ls-files --unmerged` alone can't tell "someone is resolving this right now"
+    from "an update died mid-conflict years ago"; only the MERGE_HEAD marker can."""
+    import subprocess
+
+    def git(*args, check=True):
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (tmp_path / "f.txt").write_text("feature change\n")
+    git("commit", "-qam", "feature change")
+    git("checkout", "-q", "main")
+    (tmp_path / "f.txt").write_text("main change\n")
+    git("commit", "-qam", "main change")
+    git("merge", "feature", check=False)  # conflicts by construction
+
+    assert (tmp_path / ".git" / "MERGE_HEAD").exists()
+    conflicted = (tmp_path / "f.txt").read_text()
+    assert "<<<<<<<" in conflicted
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert exc_info.value.code == 1
+
+    # Nothing was touched: still merging, same conflict markers, no stash created.
+    assert (tmp_path / ".git" / "MERGE_HEAD").exists()
+    assert (tmp_path / "f.txt").read_text() == conflicted
+    assert git("ls-files", "--unmerged").stdout.strip()
+    assert git("stash", "list").stdout.strip() == ""
+
+
+def test_stash_refuses_when_rebase_is_in_progress(tmp_path):
+    """Same guard, directory-based marker: an interactive/merge rebase leaves `.git/rebase-merge`,
+    not `MERGE_HEAD`, while its conflicts are unresolved."""
+    import subprocess
+
+    def git(*args, check=True):
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (tmp_path / "f.txt").write_text("feature change\n")
+    git("commit", "-qam", "feature change")
+    git("checkout", "-q", "main")
+    (tmp_path / "f.txt").write_text("main change\n")
+    git("commit", "-qam", "main change")
+    git("rebase", "feature", check=False)  # conflicts, rebase-merge/rebase-apply dir left behind
+
+    assert (tmp_path / ".git" / "rebase-merge").exists() or (tmp_path / ".git" / "rebase-apply").exists()
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert exc_info.value.code == 1
+    assert (tmp_path / ".git" / "rebase-merge").exists() or (tmp_path / ".git" / "rebase-apply").exists()
+    assert git("stash", "list").stdout.strip() == ""
+
+
 def test_stash_selector_is_a_bare_index_never_a_brace_selector(tmp_path):
     """The updater drops its autostash through a selector read back from ``git stash list``; on
     native Windows MSYS strips the braces from ``stash@{N}`` in git.exe's argv, so the selector
