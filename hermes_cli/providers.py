@@ -92,6 +92,65 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
 }
 
 
+# -- OAuth auth handlers -------------------------------------------------------
+# Runtime credential resolvers for auth_type values that piggyback on an
+# external CLI's OAuth session instead of a pasted API key.  Keyed by the
+# canonical config value of ``providers.<name>.auth_type``; values are lazy
+# ``module:function`` import paths so this module stays import-light.
+#
+# ``oauth_claude_code`` — Anthropic via the Claude CLI's token at
+# ~/.claude/.credentials.json (Claude Pro/Max subscription, no API key).
+# Enable with: ``hermes config set providers.anthropic.auth_type oauth_claude_code``
+
+OAUTH_AUTH_HANDLERS: Dict[str, str] = {
+    "oauth_claude_code": "providers.auth.anthropic_oauth:resolve_anthropic_oauth_runtime_credentials",
+}
+
+
+def get_oauth_auth_handler(auth_type: str):
+    """Return the runtime credential resolver registered for *auth_type*.
+
+    Resolves the ``module:function`` path lazily. Returns None when the
+    auth_type has no registered handler or the import fails.
+    """
+    from providers.auth.anthropic_oauth import is_claude_code_oauth_auth_type
+
+    key = str(auth_type or "").strip().lower().replace("-", "_")
+    if is_claude_code_oauth_auth_type(key):
+        key = "oauth_claude_code"
+    path = OAUTH_AUTH_HANDLERS.get(key)
+    if not path:
+        return None
+    module_name, _, func_name = path.partition(":")
+    try:
+        import importlib
+
+        module = importlib.import_module(module_name)
+        return getattr(module, func_name)
+    except Exception as exc:
+        logger.warning("Failed to load OAuth auth handler %s: %s", path, exc)
+        return None
+
+
+def normalize_auth_type(value: Any, default: str = "api_key") -> str:
+    """Normalize a config ``auth_type`` value to a canonical ProviderDef value.
+
+    Handler-specific spellings (``oauth_claude_code`` and aliases) collapse to
+    ``oauth_external`` so existing consumers that gate on the generic auth-type
+    sets (accounts tab, credential checks) treat them as OAuth providers. The
+    specific handler is re-derived from the raw config entry at runtime via
+    ``providers.auth.anthropic_oauth.is_claude_code_oauth_auth_type``.
+    """
+    from providers.auth.anthropic_oauth import is_claude_code_oauth_auth_type
+
+    text = str(value or "").strip().lower().replace("-", "_")
+    if not text:
+        return default
+    if is_claude_code_oauth_auth_type(text):
+        return "oauth_external"
+    return text
+
+
 # -- Resolved provider -------------------------------------------------------
 
 @dataclass
@@ -391,10 +450,18 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
 
 # -- Provider from user config ------------------------------------------------
 
-def _user_pdef(pid: str, name: str, base_url: str, key_env: str, transport: str = "openai_chat") -> ProviderDef:
-    """``source="user-config"`` ProviderDef shared by ``providers:`` and ``custom_providers:`` entries."""
-    return ProviderDef(id=pid, name=name, transport=transport, api_key_env_vars=(key_env,) if key_env else (),
-                       base_url=base_url, is_aggregator=False, auth_type="api_key", source="user-config")
+def _user_pdef(pid: str, name: str, base_url: str, key_env: str, transport: str = "openai_chat",
+               *, env_vars: Optional[Tuple[str, ...]] = None, base_url_env_var: str = "",
+               is_aggregator: bool = False, auth_type: str = "api_key") -> ProviderDef:
+    """``source="user-config"`` ProviderDef shared by ``providers:`` and ``custom_providers:`` entries.
+
+    ``env_vars`` overrides the single-``key_env`` tuple (used when a sparse ``providers:`` entry
+    inherits a built-in provider's env-var chain); the remaining keyword fields likewise carry
+    inherited built-in defaults — see :func:`resolve_user_provider`."""
+    return ProviderDef(id=pid, name=name, transport=transport,
+                       api_key_env_vars=env_vars if env_vars is not None else ((key_env,) if key_env else ()),
+                       base_url=base_url, base_url_env_var=base_url_env_var,
+                       is_aggregator=is_aggregator, auth_type=auth_type, source="user-config")
 
 
 def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[ProviderDef]:
@@ -402,10 +469,29 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     entry = user_config.get(name) if isinstance(user_config, dict) and user_config else None
     if not isinstance(entry, dict):
         return None
-    return _user_pdef(name, entry.get("name", "") or name,
-                      entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "") or "",
-                      entry.get("key_env") or entry.get("api_key_env") or "",
-                      entry.get("transport", "openai_chat") or "openai_chat")
+    # When the entry name IS a canonical built-in provider (not merely an alias — aliases like
+    # "openai" → "openrouter" must not hijack a user entry, see resolve_provider_full step 0),
+    # inherit the built-in definition's defaults. This lets a sparse override such as
+    # ``providers.anthropic.auth_type: oauth_claude_code`` keep the correct transport/base_url/env
+    # vars instead of degrading to openai_chat + "".
+    raw = name.strip().lower()
+    builtin: Optional[ProviderDef] = get_provider(raw) if normalize_provider(raw) == raw else None
+
+    key_env = entry.get("key_env") or entry.get("api_key_env") or ""
+    env_vars: Tuple[str, ...] = (key_env,) if key_env else (builtin.api_key_env_vars if builtin else ())
+    return _user_pdef(
+        name,
+        entry.get("name", "") or (builtin.name if builtin else name),
+        (entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "")
+         or (builtin.base_url if builtin else "")),
+        key_env,
+        entry.get("transport", "") or (builtin.transport if builtin else "") or "openai_chat",
+        env_vars=env_vars,
+        base_url_env_var=builtin.base_url_env_var if builtin else "",
+        is_aggregator=builtin.is_aggregator if builtin else False,
+        auth_type=normalize_auth_type(entry.get("auth_type", ""),
+                                      default=builtin.auth_type if builtin else "api_key"),
+    )
 
 
 def custom_provider_slug(display_name: str, provider_key: str = "") -> str:

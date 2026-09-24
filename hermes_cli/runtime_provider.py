@@ -349,6 +349,12 @@ def _anthropic_cfg_base_url(model_cfg: Dict[str, Any]) -> str:
 
 
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
+    # ``providers.anthropic.auth_type: oauth_claude_code`` opts out of the env/credential-file
+    # API-key chain entirely, so the Claude CLI's OAuth token is consulted first (and its
+    # AuthError propagates) — see :func:`_anthropic_oauth_token`.
+    oauth_token = _anthropic_oauth_token()
+    if oauth_token:
+        return oauth_token
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
@@ -428,6 +434,49 @@ def _finalize_base_url(provider: str, api_mode: str, base_url: str) -> str:
 
 
 # ── model config ───────────────────────────────────────────────────────────────────────────
+
+
+def _anthropic_claude_code_oauth_configured() -> bool:
+    """True when config.yaml opts native Anthropic into Claude Code OAuth.
+
+    Set via ``hermes config set providers.anthropic.auth_type oauth_claude_code``
+    — Hermes then authenticates with the OAuth token the Claude CLI manages at
+    ~/.claude/.credentials.json (Claude Pro/Max subscription) instead of the
+    env-var API-key chain.
+    """
+    try:
+        config = load_config()
+    except Exception:
+        return False
+    providers_cfg = config.get("providers")
+    if not isinstance(providers_cfg, dict):
+        return False
+    entry = providers_cfg.get("anthropic")
+    if not isinstance(entry, dict):
+        return False
+
+    from providers.auth.anthropic_oauth import is_claude_code_oauth_auth_type
+
+    return is_claude_code_oauth_auth_type(entry.get("auth_type"))
+
+
+def _anthropic_oauth_token() -> Optional[str]:
+    """Claude Code OAuth bearer for native Anthropic, or None when not opted in.
+
+    Consulted first by :func:`_anthropic_token_or_raise` (the single chokepoint every native
+    Anthropic runtime path goes through). The handler's AuthError — missing / expired-beyond-refresh
+    credentials, carrying relogin hints — propagates rather than silently falling back to an API key
+    the user explicitly opted out of.
+    """
+    if not _anthropic_claude_code_oauth_configured():
+        return None
+    from hermes_cli.providers import get_oauth_auth_handler
+
+    handler = get_oauth_auth_handler("oauth_claude_code")
+    if handler is None:
+        return None
+    creds = handler()
+    return str(creds.get("api_key") or "") or None
 
 
 def _auto_detect_local_model(base_url: str) -> str:
